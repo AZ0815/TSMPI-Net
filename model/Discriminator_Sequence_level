@@ -1,1 +1,582 @@
+from __future__ import annotations
 
+from typing import Optional, Sequence, Tuple, Union
+from functools import reduce
+from operator import mul
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+from einops import rearrange
+
+
+def trunc_normal_(tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0) -> torch.Tensor:
+    return nn.init.trunc_normal_(tensor, mean=mean, std=std, a=-2.0 * std, b=2.0 * std)
+
+
+def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1.0 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor = random_tensor.floor()
+    return x.div(keep_prob) * random_tensor
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return drop_path(x, self.drop_prob, self.training)
+
+
+def to_3tuple(x: Union[int, Sequence[int], Tuple[int, int, int]]) -> Tuple[int, int, int]:
+    if isinstance(x, int):
+        return (x, x, x)
+    x = tuple(int(v) for v in x)
+    if len(x) != 3:
+        raise ValueError(f"Expected 3 values, got {x}")
+    return x
+
+
+# -------------------------
+# Core components
+# -------------------------
+class Mlp(nn.Module):
+    """Multilayer perceptron."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: Optional[int] = None,
+        out_features: Optional[int] = None,
+        act_layer: type[nn.Module] = nn.GELU,
+        drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+def window_partition(x: torch.Tensor, window_size: Tuple[int, int, int]) -> torch.Tensor:
+    if x.dim() != 5:
+        raise ValueError(f"window_partition expects (B,D,H,W,C), got {tuple(x.shape)}")
+    B, D, H, W, C = x.shape
+    wd, wh, ww = window_size
+    if D % wd != 0 or H % wh != 0 or W % ww != 0:
+        raise ValueError(
+            f"D/H/W must be divisible by window_size={window_size}, got D={D}, H={H}, W={W}"
+        )
+
+    x = x.view(B, D // wd, wd, H // wh, wh, W // ww, ww, C)
+    windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, reduce(mul, window_size), C)
+    return windows
+
+
+def window_reverse(
+    windows: torch.Tensor,
+    window_size: Tuple[int, int, int],
+    B: int,
+    D: int,
+    H: int,
+    W: int,
+) -> torch.Tensor:
+    """Reverse windows back to (B, D, H, W, C)."""
+    wd, wh, ww = window_size
+    x = windows.view(B, D // wd, H // wh, W // ww, wd, wh, ww, -1)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, D, H, W, -1)
+    return x
+
+
+def get_window_size(
+    x_size: Tuple[int, int, int],
+    window_size: Tuple[int, int, int],
+    shift_size: Optional[Tuple[int, int, int]] = None,
+) -> Union[Tuple[int, int, int], Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
+    """Adapt window/shift sizes if input is smaller than configured window."""
+    use_window_size = list(window_size)
+    if shift_size is not None:
+        use_shift_size = list(shift_size)
+
+    for i in range(len(x_size)):
+        if x_size[i] <= window_size[i]:
+            use_window_size[i] = x_size[i]
+            if shift_size is not None:
+                use_shift_size[i] = 0
+
+    if shift_size is None:
+        return tuple(use_window_size)
+    return tuple(use_window_size), tuple(use_shift_size)
+
+
+class WindowAttention3D(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        window_size: Tuple[int, int, int],
+        num_heads: int,
+        qkv_bias: bool = False,
+        qk_scale: Optional[float] = None,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.window_size = to_3tuple(window_size)
+        self.num_heads = num_heads
+
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        wd, wh, ww = self.window_size
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * wd - 1) * (2 * wh - 1) * (2 * ww - 1), num_heads)
+        )
+
+        # pair-wise relative position index
+        coords_d = torch.arange(wd)
+        coords_h = torch.arange(wh)
+        coords_w = torch.arange(ww)
+        try:
+            coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w, indexing="ij"))
+        except TypeError:
+            coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w))  # older torch
+        coords_flatten = torch.flatten(coords, 1)  # 3, wd*wh*ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 3, N, N
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # N, N, 3
+
+        relative_coords[:, :, 0] += wd - 1
+        relative_coords[:, :, 1] += wh - 1
+        relative_coords[:, :, 2] += ww - 1
+
+        relative_coords[:, :, 0] *= (2 * wh - 1) * (2 * ww - 1)
+        relative_coords[:, :, 1] *= (2 * ww - 1)
+        relative_position_index = relative_coords.sum(-1)  # N, N
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: (num_windows*B, N, C)"""
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+
+        # support potential smaller N via slicing
+        rel_index = self.relative_position_index[:N, :N].reshape(-1)
+        relative_position_bias = self.relative_position_bias_table[rel_index].reshape(N, N, -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, N, N
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class SwinTransformerBlock3D(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: Tuple[int, int, int] = (2, 6, 6),
+        shift_size: Tuple[int, int, int] = (0, 0, 0),
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_scale: Optional[float] = None,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path_prob: float = 0.0,
+        act_layer: type[nn.Module] = nn.GELU,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
+        use_checkpoint: bool = False,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = to_3tuple(window_size)
+        self.shift_size = to_3tuple(shift_size)
+        self.mlp_ratio = mlp_ratio
+        self.use_checkpoint = use_checkpoint
+
+        assert 0 <= self.shift_size[0] < self.window_size[0], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[1] < self.window_size[1], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[2] < self.window_size[2], "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention3D(
+            dim, window_size=self.window_size, num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop
+        )
+
+        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward_part1(self, x: torch.Tensor, mask_matrix: Optional[torch.Tensor]) -> torch.Tensor:
+        B, D, H, W, C = x.shape
+        window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
+
+        x = self.norm1(x)
+
+        # pad to multiples of window size
+        wd, wh, ww = window_size
+        pad_l = pad_t = pad_d0 = 0
+        pad_d1 = (wd - D % wd) % wd
+        pad_b = (wh - H % wh) % wh
+        pad_r = (ww - W % ww) % ww
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1))
+        _, Dp, Hp, Wp, _ = x.shape
+
+        # cyclic shift
+        if any(i > 0 for i in shift_size):
+            shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
+            attn_mask = mask_matrix
+        else:
+            shifted_x = x
+            attn_mask = None
+
+        # partition windows
+        x_windows = window_partition(shifted_x, window_size)  # (B*nW, Wd*Wh*Ww, C)
+
+        # attention
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # (B*nW, Wd*Wh*Ww, C)
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, *(window_size + (C,)))
+        shifted_x = window_reverse(attn_windows, window_size, B, Dp, Hp, Wp)  # (B, D', H', W', C)
+
+        # reverse shift
+        if any(i > 0 for i in shift_size):
+            x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
+        else:
+            x = shifted_x
+
+        # crop padding
+        if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
+            x = x[:, :D, :H, :W, :].contiguous()
+        return x
+
+    def forward_part2(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop_path(self.mlp(self.norm2(x)))
+
+    def forward(self, x: torch.Tensor, mask_matrix: Optional[torch.Tensor]) -> torch.Tensor:
+        shortcut = x
+        if self.use_checkpoint:
+            x = checkpoint.checkpoint(self.forward_part1, x, mask_matrix)
+        else:
+            x = self.forward_part1(x, mask_matrix)
+        x = shortcut + self.drop_path(x)
+
+        if self.use_checkpoint:
+            x = x + checkpoint.checkpoint(self.forward_part2, x)
+        else:
+            x = x + self.forward_part2(x)
+        return x
+
+
+class PatchMerging(nn.Module):
+    def __init__(self, dim: int, norm_layer: type[nn.Module] = nn.LayerNorm) -> None:
+        super().__init__()
+        self.dim = dim
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = norm_layer(4 * dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, D, H, W, C)"""
+        B, D, H, W, C = x.shape
+
+        # padding for odd H/W
+        if (H % 2 == 1) or (W % 2 == 1):
+            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+
+        x0 = x[:, :, 0::2, 0::2, :]
+        x1 = x[:, :, 1::2, 0::2, :]
+        x2 = x[:, :, 0::2, 1::2, :]
+        x3 = x[:, :, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], dim=-1)
+
+        x = self.norm(x)
+        x = self.reduction(x)
+        return x
+
+
+def compute_mask(
+    D: int,
+    H: int,
+    W: int,
+    window_size: Tuple[int, int, int],
+    shift_size: Tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute attention mask for shifted windows."""
+    wd, wh, ww = window_size
+    sd, sh, sw = shift_size
+
+    img_mask = torch.zeros((1, D, H, W, 1), device=device)
+    cnt = 0
+
+    d_slices = (slice(0, -wd), slice(-wd, -sd), slice(-sd, None))
+    h_slices = (slice(0, -wh), slice(-wh, -sh), slice(-sh, None))
+    w_slices = (slice(0, -ww), slice(-ww, -sw), slice(-sw, None))
+
+    for d in d_slices:
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, d, h, w, :] = cnt
+                cnt += 1
+
+    mask_windows = window_partition(img_mask, window_size)  # (nW, ws_prod, 1)
+    mask_windows = mask_windows.squeeze(-1)  # (nW, ws_prod)
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, 0.0)
+    return attn_mask
+
+
+class BasicLayer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        window_size: Tuple[int, int, int] = (2, 6, 6),
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        qk_scale: Optional[float] = None,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: Union[float, list[float]] = 0.0,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
+        downsample: Optional[type[nn.Module]] = None,
+        use_checkpoint: bool = False,
+    ) -> None:
+        super().__init__()
+        self.window_size = to_3tuple(window_size)
+        self.shift_size = tuple(i // 2 for i in self.window_size)
+        self.depth = depth
+        self.use_checkpoint = use_checkpoint
+
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock3D(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=self.window_size,
+                shift_size=(0, 0, 0) if (i % 2 == 0) else self.shift_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop,
+                attn_drop=attn_drop,
+                drop_path_prob=drop_path[i] if isinstance(drop_path, list) else float(drop_path),
+                norm_layer=norm_layer,
+                use_checkpoint=use_checkpoint,
+            )
+            for i in range(depth)
+        ])
+
+        self.downsample = downsample(dim=dim, norm_layer=norm_layer) if downsample is not None else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, C, D, H, W)"""
+        if x.dim() != 5:
+            raise ValueError(f"BasicLayer expects (B,C,D,H,W), got {tuple(x.shape)}")
+
+        B, C, D, H, W = x.shape
+        window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
+
+        x = rearrange(x, "b c d h w -> b d h w c")
+
+        Dp = int(math.ceil(D / window_size[0])) * window_size[0]
+        Hp = int(math.ceil(H / window_size[1])) * window_size[1]
+        Wp = int(math.ceil(W / window_size[2])) * window_size[2]
+
+        attn_mask = compute_mask(Dp, Hp, Wp, window_size, shift_size, x.device)
+
+        for blk in self.blocks:
+            x = blk(x, attn_mask)
+
+        # safer than view for non-contiguous tensors
+        x = x.reshape(B, D, H, W, -1)
+
+        if self.downsample is not None:
+            x = self.downsample(x)
+
+        x = rearrange(x, "b d h w c -> b c d h w")
+        return x
+
+
+class PatchEmbed3D(nn.Module):
+    def __init__(
+        self,
+        patch_size: Tuple[int, int, int] = (1, 1, 1),
+        in_chans: int = 1,
+        embed_dim: int = 8,
+        target_size: int = 48,
+        norm_layer: Optional[type[nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        self.patch_size = to_3tuple(patch_size)
+        self.target_size = int(target_size)
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
+        self.norm = norm_layer(embed_dim) if norm_layer is not None else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            raise ValueError(f"PatchEmbed3D expects (B,C,D,H,W), got {tuple(x.shape)}")
+
+        _, _, D, H, W = x.size()
+
+        if H > self.target_size or W > self.target_size:
+            raise ValueError(
+                f"Input H/W exceed target_size={self.target_size}: got H={H}, W={W}. "
+                "Please resize/crop inputs or increase target_size."
+            )
+
+        pad_h = self.target_size - H
+        pad_w = self.target_size - W
+
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+
+        # F.pad order for 5D (N,C,D,H,W): (w_left, w_right, h_top, h_bottom, d_front, d_back)
+        x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom, 0, 0), mode="constant", value=0.0)
+
+        x = self.proj(x)  # (B, C, D, Wh, Ww)
+
+        if self.norm is not None:
+            Dn, Wh, Ww = x.size(2), x.size(3), x.size(4)
+            x = x.flatten(2).transpose(1, 2)  # (B, D*Wh*Ww, C)
+            x = self.norm(x)
+            x = x.transpose(1, 2).reshape(-1, self.embed_dim, Dn, Wh, Ww)
+
+        return x
+
+
+class Discriminator_Sequence(nn.Module):
+    def __init__(
+        self,
+        patch_size: Tuple[int, int, int] = (1, 1, 1),
+        in_chans: int = 1,
+        embed_dim: int = 8,
+        depths: Tuple[int, int, int, int] = (2, 2, 6, 2),
+        num_heads: Tuple[int, int, int, int] = (2, 4, 8, 16),
+        window_size: Tuple[int, int, int] = (2, 6, 6),
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_scale: Optional[float] = None,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        drop_path_rate: float = 0.2,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
+        patch_norm: bool = False,
+        frozen_stages: int = -1,
+        use_checkpoint: bool = False,
+        num_classes: int = 1,
+        target_size: int = 48,
+    ) -> None:
+        super().__init__()
+
+        self.num_classes = num_classes
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.patch_norm = patch_norm
+        self.frozen_stages = frozen_stages
+        self.window_size = to_3tuple(window_size)
+        self.patch_size = to_3tuple(patch_size)
+
+        self.patch_embed = PatchEmbed3D(
+            patch_size=self.patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            target_size=target_size,
+            norm_layer=norm_layer if self.patch_norm else None,
+        )
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = BasicLayer(
+                dim=int(embed_dim * 2 ** i_layer),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=self.window_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=PatchMerging if i_layer < self.num_layers - 1 else None,
+                use_checkpoint=use_checkpoint,
+            )
+            self.layers.append(layer)
+
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+
+        self.norm = norm_layer(self.num_features)
+        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity(),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+
+        for layer in self.layers:
+            x = layer(x.contiguous())
+
+        x = rearrange(x, "n c d h w -> n d h w c")
+        x = self.norm(x)
+        x = rearrange(x, "n d h w c -> n c d h w")
+
+        x = self.avg_pool(x)          # (N, C, 1, 1, 1)
+        x = torch.flatten(x, 1)       # (N, C)
+        x = self.head(x)              # (N, num_classes)
+        return x

@@ -23,7 +23,7 @@ class H5Dataset(data.Dataset):
         for i in file_path_list:
             file_path = os.path.join(dir_path, i)
             with h5py.File(file_path, 'r') as f:
-                signal_idx = np.random.randint(1, 11)  # 生成1-10的随机整数
+                signal_idx = np.random.randint(1, 11)
                 signal_key = f'signal{signal_idx}'
                 data_1d = np.array(f[signal_key])
                 data_2d = np.array(f['image'])
@@ -43,11 +43,6 @@ class H5Dataset(data.Dataset):
 
 
 class CleanH5Dataset(data.Dataset):
-    """
-    Wrapper around your H5Dataset (unchanged) that:
-    - sanitizes NaN/Inf outputs (e.g., division by zero when max(image)==0)
-    """
-
     def __init__(self, base: H5Dataset):
         self.base = base
 
